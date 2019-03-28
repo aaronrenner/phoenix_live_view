@@ -166,8 +166,44 @@ let maybe = (el, key) => {
   }
 }
 
+let gatherFiles = (form) => {
+  const formData = new FormData(form)
+  let files = {}
+  formData.forEach((val, key) => {
+    if (val instanceof File && val.size > 0) {
+      files[key] = val
+    }
+  })
+  return files
+}
+
+
+
+let uploadFiles = (files, channel) => {
+  for(let key in files){
+    let file = files[key]
+    var reader = new FileReader()
+    reader.onload = function(e) {
+      channel.push({file: e.target.result})
+    }
+    reader.readAsArrayBuffer(file)
+  }
+}
+
 let serializeForm = (form) => {
-  return((new URLSearchParams(new FormData(form))).toString())
+  const formData = new FormData(form)
+  let files = {}
+  let readerCount = 0
+  formData.forEach((val, key) => {
+    if (val instanceof File && val.size > 0) {
+      var reader = new FileReader()
+      formData.set(`${key}[name]`, val.name);
+      formData.set(`${key}[type]`, val.type);
+      formData.set(`${key}[size]`, val.size);
+    }
+  })
+
+  return new URLSearchParams(formData).toString()
 }
 
 let recursiveMerge = (target, source) => {
@@ -232,6 +268,41 @@ export let Rendered = {
   }
 }
 
+function writeBinaryString(view, string, offset) {
+  let i = 0;
+  for (i; i < string.length; i++) {
+    view.setUint8(offset + i, string.charCodeAt(i))
+  }
+  return offset + i;
+}
+
+function binaryEncode(message , cb) {
+  const { join_ref, ref, topic, event: { file } } = message
+  const headerLength = 2;
+  const metaLength = 3 + join_ref.length + ref.length + topic.length;
+  const fileLength = file.byteLength;
+  const buffer = new ArrayBuffer(headerLength + metaLength + fileLength);
+
+  const view = new DataView(buffer);
+  view.setUint8(0, 0) // TODO: consider parts here
+  view.setUint8(1, 1)
+  view.setUint8(2, ref.length)
+  view.setUint8(3, join_ref.length)
+  view.setUint8(4, topic.length)
+  let offset = writeBinaryString(view, ref, 5);
+  offset = writeBinaryString(view, join_ref, offset);
+  offset = writeBinaryString(view, topic, offset);
+
+  let i = 0;
+  const arr = new Uint8Array(file);
+  for (0; i < file.byteLength; i++) {
+    view.setUint8(offset + i, arr[i]);
+  }
+
+  cb(view.buffer);
+}
+
+
 // todo document LiveSocket specific options like viewLogger
 export class LiveSocket {
   constructor(url, opts = {}){
@@ -248,6 +319,14 @@ export class LiveSocket {
     window.addEventListener("beforeunload", e => {
       this.unloaded = true
     })
+    const encode = this.socket.encode
+    this.socket.encode = function(message, cb) {
+      if (message.event.file) {
+        binaryEncode(message, cb)
+      } else {
+        encode(message, cb)
+      }
+    }
     this.bindingPrefix = opts.bindingPrefix || BINDING_PREFIX
     this.opts = opts
     this.views = {}
@@ -543,6 +622,10 @@ let DOM = {
         }
       },
       onBeforeElUpdated: function(fromEl, toEl) {
+        // file upload
+        if (fromEl.nodeName === "INPUT" && toEl.nodeName === "INPUT" && fromEl.type === "file") {
+          return false;
+        }
         // nested view handling
         if(DOM.isPhxChild(toEl)){
           DOM.mergeAttrs(fromEl, toEl)
@@ -610,6 +693,11 @@ export class View {
     this.channel = this.liveSocket.channel(`lv:${this.id}`, () => {
       return {session: this.getSession()}
     })
+
+    this.uploadChannel = this.liveSocket.channel(`lvu:${this.id}`, () => {
+      return {session: this.getSession()}
+    })
+
     this.loaderTimer = setTimeout(() => this.showLoader(), LOADER_TIMEOUT)
     this.bindChannel()
   }
@@ -705,6 +793,8 @@ export class View {
       .receive("ok", data => this.onJoin(data))
       .receive("error", resp => this.onJoinError(resp))
       .receive("timeout", () => this.onJoinError("timeout"))
+
+    this.uploadChannel.join()
   }
 
   onJoinError(resp){
@@ -762,11 +852,20 @@ export class View {
   }
 
   pushFormSubmit(formEl, phxEvent, onReply){
-    this.pushWithReply("event", {
-      type: "form",
-      event: phxEvent,
-      value: serializeForm(formEl)
-    }, onReply)
+    let files = gatherFiles(formEl)
+    if (Object.keys(files).length > 0) {
+      console.log("has files");
+      uploadFiles(files, this.uploadChannel);
+      // lock form
+      // upload files
+      // submit
+    } else {
+      this.pushWithReply("event", {
+        type: "form",
+        event: phxEvent,
+        value: serializeForm(formEl)
+      }, onReply)
+    }
   }
 
   ownsElement(element){
